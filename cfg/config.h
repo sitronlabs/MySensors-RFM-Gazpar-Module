@@ -14,8 +14,12 @@
 
 /* Battery monitoring configuration */
 #define CONFIG_BATTERY_PIN A0
+#define CONFIG_BATTERY_VOLTAGE_DIVIDER_R1 1000.0
+#define CONFIG_BATTERY_VOLTAGE_DIVIDER_R2 300.0
+#define CONFIG_BATTERY_REPORTING_INTERVAL 3600000U  //!< An hour
 
-/* Input configuration */
-#define CONFIG_GAZPAR_PULSE_PIN 3
+/* Volume monitoring configuration */
+#define CONFIG_VOLUME_PULSE_PIN 3
+#define CONFIG_VOLUME_REPORTING_INTERVAL 180000U  //!< Three minutes
 
 #endif

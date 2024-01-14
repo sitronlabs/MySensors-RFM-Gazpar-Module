@@ -1,6 +1,11 @@
 /* Config */
 #include "../cfg/config.h"
 
+/* Project code */
+#include "battery.h"
+#include "global.h"
+#include "volume.h"
+
 /* Arduino Libraries */
 #include <Arduino.h>
 #include <MySensors.h>
@@ -9,16 +14,8 @@
 #include <ctype.h>
 #include <stdlib.h>
 
-/* */
-static double volatile m_value_initial;         //!< In cubic meters
-static uint32_t m_value_pulses;                 //!< Number of pulses
-static bool volatile m_value_initial_received;  //!<
-
-/* List of virtual sensors */
-enum {
-    SENSOR_0_MANAL,  // S_INFO (V_TEXT)
-    SENSOR_1_GAS,    // S_GAS (V_VOLUME)
-};
+/* Work variables */
+static volatile bool m_received;
 
 /**
  * Setup function.
@@ -35,7 +32,7 @@ void setup(void) {
     analogRead(CONFIG_BATTERY_PIN);
 
     /* Setup pulse input */
-    pinMode(CONFIG_GAZPAR_PULSE_PIN, INPUT);
+    pinMode(CONFIG_VOLUME_PULSE_PIN, INPUT);
 }
 
 /**
@@ -57,14 +54,14 @@ void presentation(void) {
                 }
                 break;
             }
-            case SENSOR_0_MANAL: {
-                if (present(SENSOR_0_MANAL, S_INFO, F("Relevé manuel")) == true) {
+            case SENSOR_0_MANUAL: {
+                if (present(SENSOR_0_MANUAL, S_INFO, F("Relevé manuel")) == true) {
                     step++;
                 }
                 break;
             }
-            case SENSOR_1_GAS: {
-                if (present(SENSOR_1_GAS, S_GAS, F("Consommation")) == true) {
+            case SENSOR_1_VOLUME: {
+                if (present(SENSOR_1_VOLUME, S_GAS, F("Volume")) == true) {
                     step++;
                 }
                 break;
@@ -85,20 +82,24 @@ void presentation(void) {
  */
 void receive(const MyMessage &message) {
 
+    /* Set flag */
+    m_received = true;
+
     /* Handle user manual input initial value */
-    if (message.sensor == SENSOR_0_MANAL && message.getType() == V_TEXT) {
-        m_value_initial = strtod(message.getString(), NULL);
-        m_value_pulses = 0;
-        m_value_initial_received = true;
-        MyMessage message(SENSOR_0_MANAL, V_TEXT);
-        send(message.set(""));
+    if (message.sensor == SENSOR_0_MANUAL && message.getType() == V_TEXT) {
+        char input[MAX_PAYLOAD_SIZE + 1] = {0};
+        strncpy(input, message.getString(), MAX_PAYLOAD_SIZE);
+        for (uint8_t i = 0; i < MAX_PAYLOAD_SIZE + 1; i++) {
+            if (input[i] == ',') {
+                input[i] = '.';
+            }
+        }
+        volume_set(input);
     }
 
     /* Handle value sent by controller */
-    else if (message.sensor == SENSOR_1_GAS && message.getType() == V_VOLUME) {
-        m_value_initial = message.getFloat();
-        m_value_pulses = 0;
-        m_value_initial_received = true;
+    else if (message.sensor == SENSOR_1_VOLUME && message.getType() == V_VOLUME) {
+        volume_set(message.getFloat());
     }
 }
 
@@ -106,132 +107,74 @@ void receive(const MyMessage &message) {
  * Main loop.
  */
 void loop(void) {
-    int res;
+    int32_t time_sleep_initial = INT32_MAX;
+    int32_t time_sleep_left = INT32_MAX;
 
-    /* Sensor task */
-    {
-        static enum {
-            STATE_0,
-            STATE_1,
-            STATE_2,
-            STATE_3,
-            STATE_4,
-            STATE_5,
-        } m_sm;
-        switch (m_sm) {
+    /* Call volume reporting task */
+    int32_t task_res = volume_task();
+    if (task_res < time_sleep_initial) {
+        time_sleep_initial = task_res;
+    }
 
-            case STATE_0: {
+    /* Call battery reporting task */
+    task_res = battery_task();
+    if (task_res < time_sleep_initial) {
+        time_sleep_initial = task_res;
+    }
 
-                /* Present user with a text input to set the initial value */
-                MyMessage message(SENSOR_0_MANAL, V_TEXT);
-                if (send(message.set("")) != true) {
-                    sleep(1000);
-                    break;
-                }
+    /* Sleep if possible
+     * Note, smartsleep is implemented manually because otherwise the pusle interrupt would cause mysensors to send two messages systematically */
+    if (time_sleep_initial > 0) {
 
-                /* Move on */
-                m_sm = STATE_1;
-                break;
-            }
+        /* Notify gateway of our intention to sleep */
+        _msgTmp = build(_msgTmp, GATEWAY_ADDRESS, NODE_SENSOR_ID, C_INTERNAL, I_PRE_SLEEP_NOTIFICATION);
+        _msgTmp.set((uint32_t)MY_SMART_SLEEP_WAIT_DURATION_MS);
+        _sendRoute(_msgTmp);
 
-            case STATE_1: {
-
-                /* Request last value
-                 * this is done to keep the value incrementing across reboots
-                 * the response will be processed in the receive() function */
-                if (request(SENSOR_1_GAS, V_VOLUME) != true) {
-                    sleep(1000);
-                    break;
-                }
-
-                /* Move on */
-                m_sm = STATE_2;
-                break;
-            }
-
-            case STATE_2: {
-
-                /* Wait for initial value to be retrieved */
-                if (m_value_initial_received != true) {
-                    sleep(1000, true);
-                    m_sm = STATE_1;
-                    break;
-                }
-
-                /* Move on */
-                Serial.printf(" [w] Retrieved value from controller.\r\n");
-                m_sm = STATE_3;
-                break;
-            }
-
-            case STATE_3: {
-
-                /* Compute battery level */
-                double adc_voltage = (1.1 * analogRead(CONFIG_BATTERY_PIN)) / 1023.0;
-                double bat_voltage = (adc_voltage * (1000 + 300)) / 300.0;
-                double bat_ratio = (bat_voltage - 3.6) / (4.2 - 3.6);
-                if (bat_ratio < 0) {
-                    bat_ratio = 0;
-                } else if (bat_ratio > 1) {
-                    bat_ratio = 1;
-                }
-                uint8_t bat_pct = bat_ratio * 100;
-
-                /* Send battery level if it has changed */
-                static uint8_t bat_pct_last = UINT8_MAX;
-                if (bat_pct_last != bat_pct) {
-                    if (sendBatteryLevel(bat_pct, false) == true) {
-                        bat_pct_last = bat_pct;
-                    } else {
-                        Serial.println(" [w] Failed to send battery level!");
-                    }
-                }
-
-                /* Move on */
-                m_sm = STATE_4;
-                break;
-            }
-
-            case STATE_4: {
-
-                /* Sleep until we get interrupted by either a pulse signal or a timeout */
-                uint8_t interrupt = digitalPinToInterrupt(CONFIG_GAZPAR_PULSE_PIN);
-                res = sleep(interrupt, FALLING, 3600000, true);
-
-                /* If we have been interrupted by a pulse signal,
-                 * increment the value and send the new one */
-                if (res == interrupt) {
-                    m_value_pulses++;
-                    m_sm = STATE_5;
-                }
-
-                /* If we have been interrupted by a timeout,
-                 * just go back to the battery reporting part */
-                else if (res == MY_WAKE_UP_BY_TIMER) {
-                    m_sm = STATE_3;
-                }
-                break;
-            }
-
-            case STATE_5: {
-
-                /* Send the value,
-                 * but if it doesn't work don't bother retrying */
-                static float value_last = 0;
-                float value = m_value_initial + (m_value_pulses * 0.010);
-                if (value != value_last) {
-                    MyMessage message(SENSOR_1_GAS, V_VOLUME);
-                    if (send(message.set(value, 3)) == true) {
-                        value_last = value;
-                    } else {
-                        Serial.println(" [w] Failed to send gas volume!");
-                    }
-                }
-
-                /* Move on */
-                m_sm = STATE_3;
-                break;
-            }
+        /* Listen for incoming messages before sleeping
+         * and cancel sleep if we receiv a message */
+        wait(MY_SMART_SLEEP_WAIT_DURATION_MS);
+        if (m_received == true) {
+            time_sleep_initial = 0;
+            m_received = false;
         }
+
+        /* Sleep */
+        for (time_sleep_left = time_sleep_initial; time_sleep_left > 0;) {
+            uint8_t sleep_interrupt = digitalPinToInterrupt(CONFIG_VOLUME_PULSE_PIN);
+            int8_t sleep_res = sleep(sleep_interrupt, FALLING, time_sleep_left, false);
+
+            /* If woken up by a pulse */
+            if (sleep_res == sleep_interrupt) {
+
+                /* Retrieve an estimate of how much time we have slept before the pin interrupt triggered,
+                 * but because getSleepRemaining will often think we have slept more than we actually did,
+                 * by an order of 8192ms, we substract half that amount */
+                uint32_t time_slept = time_sleep_left - getSleepRemaining();
+                if (time_slept > 4096) {
+                    time_slept -= 4096;
+                } else {
+                    time_slept = 0;
+                }
+                g_millis_slept += time_slept;
+                time_sleep_left -= time_slept;
+
+                /* Increase volume value, and go out of sleep if the new value justifies it */
+                if (volume_increase() == true) {
+                    break;
+                }
+            }
+
+            /* If woken up by the timer */
+            else if (sleep_res == MY_WAKE_UP_BY_TIMER) {
+                g_millis_slept += time_sleep_left;
+                time_sleep_left = 0;
+            }
+        };
+
+        /* Notify controller about waking up, payload indicates sleeping time in ms */
+        _msgTmp = build(_msgTmp, GATEWAY_ADDRESS, NODE_SENSOR_ID, C_INTERNAL, I_POST_SLEEP_NOTIFICATION);
+        _msgTmp.set(time_sleep_initial - time_sleep_left);
+        _sendRoute(_msgTmp);
     }
 }
