@@ -49,7 +49,7 @@ void presentation(void) {
          * and advance one step if successful */
         switch (step) {
             case -1: {
-                if (sendSketchInfo(F("SLHA00028 Gazpar"), F("0.2.0")) == true) {
+                if (sendSketchInfo(F("SLHA00028 Gazpar"), F("0.3.0")) == true) {
                     step++;
                 }
                 break;
